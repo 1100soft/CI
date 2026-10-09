@@ -1,0 +1,35 @@
+name: Reusable Node checks
+'on':
+  workflow_call:
+    inputs:
+      working-directory:
+        type: string
+        default: .
+      node-version:
+        type: string
+        default: '22'
+      check-command:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+        shell: bash
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: ${{ inputs.working-directory }}/package-lock.json
+    - run: npm ci
+    - name: App checks
+      env:
+        CHECK_COMMAND: ${{ inputs.check-command }}
+      run: bash -euo pipefail -c "$CHECK_COMMAND"

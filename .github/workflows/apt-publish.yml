@@ -1,0 +1,72 @@
+name: Reusable APT publication
+'on':
+  workflow_call:
+    inputs:
+      artifact-inputs:
+        type: string
+        required: true
+        description: JSON map of artifact names to download directories
+      prepare-command:
+        type: string
+        required: true
+        description: Caller-owned preparation and validation, from repository root
+      source-run-id:
+        type: string
+        default: ''
+        description: Optional previously validated source run; defaults to current run
+      dispatch-repository:
+        type: string
+        default: 1100soft/1100
+    secrets:
+      APT_DISPATCH_TOKEN:
+        required: true
+permissions:
+  contents: read
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+    - uses: actions/checkout@v6
+    - name: Download tested packages
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ARTIFACT_INPUTS: ${{ inputs.artifact-inputs }}
+        SOURCE_RUN_ID: ${{ inputs.source-run-id || github.run_id }}
+      run: |
+        python3 - <<'PYTHON'
+        import json, os, subprocess
+        artifacts = json.loads(os.environ['ARTIFACT_INPUTS'])
+        if not isinstance(artifacts, dict) or not artifacts:
+            raise ValueError('artifact-inputs must be a nonempty JSON object')
+        for name, destination in artifacts.items():
+            if not isinstance(destination, str) or not name or name.startswith('-'):
+                raise ValueError('Invalid artifact download mapping')
+            subprocess.run(['gh', 'run', 'download', os.environ['SOURCE_RUN_ID'],
+                            '--repo', os.environ['GITHUB_REPOSITORY'], '--name', name,
+                            '--dir', destination], check=True)
+        PYTHON
+    - name: Prepare and validate Debian packages
+      env:
+        PREPARE_COMMAND: ${{ inputs.prepare-command }}
+      run: bash -euo pipefail -c "$PREPARE_COMMAND"
+    - uses: actions/upload-artifact@v4
+      with:
+        name: apt-packages
+        path: apt-packages/*.deb
+        if-no-files-found: error
+        retention-days: 7
+        compression-level: 0
+    - name: Request APT publication
+      env:
+        GH_TOKEN: ${{ secrets.APT_DISPATCH_TOKEN }}
+        DISPATCH_REPOSITORY: ${{ inputs.dispatch-repository }}
+      run: |
+        set -euo pipefail
+        test -n "$GH_TOKEN" || { echo 'Configure APT_DISPATCH_TOKEN for APT publication' >&2; exit 1; }
+        gh api --method POST "repos/$DISPATCH_REPOSITORY/dispatches" \
+          -f event_type=apt-package \
+          -F "client_payload[source_repository]=$GITHUB_REPOSITORY" \
+          -F "client_payload[run_id]=$GITHUB_RUN_ID" \
+          -F 'client_payload[artifact]=apt-packages'

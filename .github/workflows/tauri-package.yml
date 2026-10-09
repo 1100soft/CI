@@ -1,0 +1,193 @@
+name: Reusable Tauri packages
+'on':
+  workflow_call:
+    inputs:
+      app-directory:
+        type: string
+        required: true
+      artifact-prefix:
+        type: string
+        required: true
+      build-matrix:
+        description: JSON include matrix with os, target, bundles and optional variant
+        type: string
+        required: true
+      version-check-command:
+        description: App-owned version/tag consistency check
+        type: string
+        required: false
+        default: 'true'
+      prepare-command:
+        description: App-owned preparation, with BUILD_TARGET and BUILD_VARIANT
+        type: string
+        default: 'true'
+      verify-command:
+        description: App-owned post-build artifact checks
+        type: string
+        default: 'true'
+      node-version:
+        type: string
+        default: '22'
+      build-command:
+        type: string
+        default: npm run tauri -- build --ci --target "$BUILD_TARGET" --bundles "$BUILD_BUNDLES" -- --locked
+      check-command:
+        type: string
+        default: 'true'
+      app-hooks:
+        type: boolean
+        default: false
+        description: Call caller-owned .github/actions/tauri-prepare and tauri-verify
+      macos-deployment-target:
+        type: string
+        default: '11.0'
+      retention-days:
+        type: number
+        default: 30
+      environment-json:
+        type: string
+        default: '{}'
+        description: JSON map of nonsecret, single-line environment values for all package steps
+    secrets:
+      build-environment:
+        required: false
+        description: JSON map of explicitly forwarded build credentials, scoped to build subprocess
+permissions:
+  contents: read
+jobs:
+  package:
+    name: Package (${{ matrix.target || matrix.platform }} / ${{ matrix.variant }})
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(inputs.build-matrix) }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.app-directory }}
+        shell: bash
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: ${{ inputs.app-directory }}/package-lock.json
+    - name: Configure app build environment
+      env:
+        APP_ENVIRONMENT: ${{ inputs.environment-json }}
+      run: |
+        node --input-type=module <<'NODE'
+        import fs from 'node:fs';
+        const values = JSON.parse(process.env.APP_ENVIRONMENT);
+        if (!values || Array.isArray(values) || typeof values !== 'object') throw new Error('Expected environment object');
+        for (const [name, value] of Object.entries(values)) {
+          if (!/^[A-Za-z_][A-Za-z_0-9]*$/.test(name) || typeof value !== 'string' || /[\r\n]/.test(value)) {
+            throw new Error('Environment names must be identifiers and values must be single-line strings');
+          }
+          fs.appendFileSync(process.env.GITHUB_ENV, `${name}=${value}\n`);
+        }
+        NODE
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ matrix.target }}
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.app-directory }}/src-tauri
+        key: package-${{ matrix.target || matrix.platform }}-${{ matrix.variant }}
+    - name: Install Linux dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes libwebkit2gtk-4.1-dev libgtk-3-dev \
+          libayatana-appindicator3-dev librsvg2-dev patchelf xdg-utils
+        sudo apt-get install --yes dbus-x11 xvfb xauth
+    - run: npm ci
+    - name: Verify release versions
+      env:
+        RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        VERSION_CHECK_COMMAND: ${{ inputs.version-check-command }}
+      run: bash -euo pipefail -c "$VERSION_CHECK_COMMAND"
+    - name: App package preparation
+      env:
+        PREPARE_COMMAND: ${{ inputs.prepare-command }}
+        BUILD_TARGET: ${{ matrix.target }}
+        BUILD_VARIANT: ${{ matrix.variant }}
+      run: bash -euo pipefail -c "$PREPARE_COMMAND"
+    - name: App preparation hook
+      if: inputs.app-hooks
+      uses: ./.github/actions/tauri-prepare
+      with:
+        matrix: ${{ toJSON(matrix) }}
+    - name: Package checks
+      env:
+        CHECK_COMMAND: ${{ inputs.check-command }}
+      run: bash -euo pipefail -c "$CHECK_COMMAND"
+    - name: Build installers
+      env:
+        APPIMAGE_EXTRACT_AND_RUN: '1'
+        APPLE_SIGNING_IDENTITY: '-'
+        BUILD_TARGET: ${{ matrix.target }}
+        BUILD_BUNDLES: ${{ matrix.bundles }}
+        BUILD_COMMAND: ${{ inputs.build-command }}
+        BUILD_ENVIRONMENT: ${{ secrets.build-environment }}
+        BUILD_VARIANT: ${{ matrix.variant }}
+      run: |
+        node --input-type=module <<'NODE'
+        import { spawnSync } from 'node:child_process';
+        const extra = JSON.parse(process.env.BUILD_ENVIRONMENT || '{}');
+        if (!extra || Array.isArray(extra) || typeof extra !== 'object' || Object.values(extra).some(v => typeof v !== 'string')) {
+          throw new Error('build-environment must be a JSON object of strings');
+        }
+        const env = { ...process.env, ...extra };
+        delete env.BUILD_ENVIRONMENT;
+        const result = spawnSync('bash', ['-euo', 'pipefail', '-c', process.env.BUILD_COMMAND], { env, stdio: 'inherit' });
+        if (result.error) throw result.error;
+        process.exit(result.status ?? 1);
+        NODE
+    - name: Verify requested bundle outputs
+      env:
+        BUILD_TARGET: ${{ matrix.target }}
+        BUILD_BUNDLES: ${{ matrix.bundles }}
+      run: |
+        set -euo pipefail
+        IFS=',' read -r -a bundles <<<"$BUILD_BUNDLES"
+        for bundle in "${bundles[@]}"; do
+          folder="src-tauri/target/${BUILD_TARGET:+$BUILD_TARGET/}release/bundle/$bundle"
+          case "$bundle" in
+            deb) pattern='*.deb' ;;
+            appimage) pattern='*.AppImage' ;;
+            nsis) pattern='*.exe' ;;
+            dmg) pattern='*.dmg' ;;
+            app) folder="src-tauri/target/${BUILD_TARGET:+$BUILD_TARGET/}release/bundle/macos"; pattern='*.app' ;;
+            *) echo "Unsupported shared bundle: $bundle" >&2; exit 1 ;;
+          esac
+          test -n "$(find "$folder" -maxdepth 1 -name "$pattern" -print -quit)"
+        done
+      if: matrix.bundles != ''
+    - name: App package verification
+      env:
+        VERIFY_COMMAND: ${{ inputs.verify-command }}
+        BUILD_TARGET: ${{ matrix.target }}
+        BUILD_VARIANT: ${{ matrix.variant }}
+      run: bash -euo pipefail -c "$VERIFY_COMMAND"
+    - name: App verification hook
+      if: inputs.app-hooks
+      uses: ./.github/actions/tauri-verify
+      with:
+        matrix: ${{ toJSON(matrix) }}
+    - name: Upload installers
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ matrix.artifact || format('{0}-{1}{2}', inputs.artifact-prefix, matrix.target, matrix.variant && format('-{0}',
+          matrix.variant) || '') }}
+        path: |
+          ${{ matrix.artifact-path || format('{0}/src-tauri/target/{1}/release/bundle/deb/*.deb', inputs.app-directory, matrix.target) }}
+          ${{ !matrix.artifact-path && format('{0}/src-tauri/target/{1}/release/bundle/appimage/*.AppImage', inputs.app-directory, matrix.target) || '' }}
+          ${{ !matrix.artifact-path && format('{0}/src-tauri/target/{1}/release/bundle/nsis/*.exe', inputs.app-directory, matrix.target) || '' }}
+          ${{ !matrix.artifact-path && format('{0}/src-tauri/target/{1}/release/bundle/dmg/*.dmg', inputs.app-directory, matrix.target) || '' }}
+        if-no-files-found: error
+        retention-days: ${{ inputs.retention-days }}
+        compression-level: 0
+    env:
+      MACOSX_DEPLOYMENT_TARGET: ${{ inputs.macos-deployment-target }}

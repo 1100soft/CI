@@ -1,0 +1,94 @@
+name: Reusable Tauri checks
+'on':
+  workflow_call:
+    inputs:
+      app-directory:
+        type: string
+        required: true
+      check-command:
+        description: App-owned frontend/version/regression checks, after npm run build
+        type: string
+        default: 'true'
+      linux-check-command:
+        description: App-owned Linux integration checks
+        type: string
+        default: 'true'
+      runner-matrix:
+        type: string
+        default: '["ubuntu-24.04","windows-2022","macos-15"]'
+        description: JSON array of runner labels
+      node-version:
+        type: string
+        default: '22'
+      native-test-command:
+        type: string
+        default: cargo test --manifest-path src-tauri/Cargo.toml --locked -- --test-threads=1
+        description: Runs on Linux; all platforms compile tests first
+      clippy:
+        type: boolean
+        default: false
+      post-native-command:
+        type: string
+        default: 'true'
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(inputs.runner-matrix) }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    defaults:
+      run:
+        working-directory: ${{ inputs.app-directory }}
+        shell: bash
+    steps:
+    - uses: actions/checkout@v6
+    - uses: actions/setup-node@v6
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+        cache-dependency-path: ${{ inputs.app-directory }}/package-lock.json
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: ${{ inputs.app-directory }}/src-tauri
+    - name: Install Linux dependencies
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install --yes libwebkit2gtk-4.1-dev libgtk-3-dev \
+          libayatana-appindicator3-dev librsvg2-dev patchelf \
+          python3-gi gir1.2-gtk-3.0 gir1.2-webkit2-4.1 xvfb xauth
+    - run: npm ci
+    - run: npm run build
+    - name: App checks
+      env:
+        CHECK_COMMAND: ${{ inputs.check-command }}
+      run: bash -euo pipefail -c "$CHECK_COMMAND"
+    - name: Compile native app and tests
+      run: cargo test --manifest-path src-tauri/Cargo.toml --locked --no-run
+    - name: Native regression tests
+      if: runner.os == 'Linux'
+      run: bash -euo pipefail -c "$NATIVE_TEST_COMMAND"
+      env:
+        NATIVE_TEST_COMMAND: ${{ inputs.native-test-command }}
+    - name: WebKit integration checks
+      if: runner.os == 'Linux'
+      env:
+        LINUX_CHECK_COMMAND: ${{ inputs.linux-check-command }}
+      run: bash -euo pipefail -c "$LINUX_CHECK_COMMAND"
+    - name: Lint Rust targets
+      if: inputs.clippy
+      run: cargo clippy --locked -j 2 --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+    - name: App native verification
+      env:
+        POST_NATIVE_COMMAND: ${{ inputs.post-native-command }}
+      run: bash -euo pipefail -c "$POST_NATIVE_COMMAND"
